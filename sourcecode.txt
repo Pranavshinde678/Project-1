@@ -1,0 +1,893 @@
+--------------------------- exampleHelperPlanExecuteTrajectoryPickPlace------------------ 
+function [positions, velocities, accelerations, 
+timestamp, success] = 
+exampleHelperPlanExecuteTrajectoryPickPlace(robot, 
+mpcTimeStep, obstacles, endEffector, jointInit, 
+taskFinal, tolerance, avoidCollisions) 
+% This function is for internal use and may be removed in 
+a future release 
+% 
+%exampleHelperPlanExecuteTrajectoryPickPlace Generate and 
+simulate motion along a collision-free trajectory 
+%   This function generates a collision-free trajectory 
+between an initial 
+%   configuration given by JOINTINIT and a target task
+space orientation, 
+%   provided by TASKFINAL. The function uses a nonlinear 
+model predictive 
+%   controller to generate optimal trajectories under the 
+constraint that 
+%   they cannot be in collision. The function then 
+simulates the tracking 
+%   behavior of the manipulator to those reference 
+trajectories as modeled 
+%   
+by a manipulator under closed-loop control, and 
+updates the 
+%   visualization. The function returns the positions, 
+velocities, and 
+%   acceleration from the generated reference 
+trajectories. 
+% 
+%   This helper function uses nlmpcmove to generate the 
+trajectories, 
+%   checkCollision to check for 
+%   collisions, and jointSpaceMotionModel to simulate the 
+motion of the 
+%   manipulator. 
+% Plan collision-free trajectories using nonlinear model 
+predictive control  
+curFormat = robot.DataFormat; 
+robot.DataFormat = 'column'; 
+% Disable display messages 
+mpcverbosity off; 
+% Get number of joints 
+numJoints = numel(robot.homeConfiguration); 
+% Get number of obstacles 
+numObstacles = numel(obstacles); 
+% Get number of collision bodies 
+if ~isempty(obstacles) && avoidCollisions 
+[~, separationDist, ~] = checkCollision(robot, 
+homeConfiguration(robot), obstacles, 
+'IgnoreSelfCollision', 'On', 'Exhaustive', 'on'); 
+tempDistances = 
+separationDist(1:robot.NumBodies,1:numObstacles); 
+bodyIndices = 
+find((isinf(tempDistances(:,1))|isnan(tempDistances(:,1))
+ )==0); 
+numBodies = numel(bodyIndices); 
+else 
+numBodies = robot.NumBodies; 
+end 
+% Current robot joint configuration 
+currentRobotJConfig = wrapToPi(jointInit'); 
+% Final (desired) end-effector pose 
+anglesFinal = rotm2eul(taskFinal(1:3,1:3),'XYZ'); 
+poseFinal = [taskFinal(1:3,4);anglesFinal']; % 6x1 vector 
+for final pose: [x, y, z, phi, theta, psi] 
+% Initialize safety distance away from the obstacles 
+safetyDistance = 0.005;  
+% World of obstacles 
+world = obstacles; 
+%% Set up the Nonlinear Model Predictive Controller 
+(NLMPC) 
+% Cost weights 
+Qr = diag([1 1 1 0 0 0]); % running cost weight on 
+desired end-effector pose [x, y, z, phi, theta, psi] 
+Qt = diag([10 10 10 1 1 1]); % terminal cost weight on 
+desired end-effector pose [x, y, z, phi, theta, psi] 
+Qu = diag([1 1 1 1 1 1 1])/10; % input cost weight on 
+joint accelerations qDdot 
+Qv = diag([1 1 1 1 1 1 1])/10; 
+—————————————————————————————————— 
+% Model joints as double integrators 
+nx = numJoints * 2; % [q,qDot] 
+ny = numJoints; % [q] 
+nu = numJoints; % [qDdot] 
+% Initialize nlmpc object 
+nlobj = nlmpc(nx,ny,nu); 
+% Solver time step 
+Ts = mpcTimeStep; % seconds 
+nlobj.Ts = Ts;  
+% Configure NLMPC solver functions 
+nlobj.Model.StateFcn = @(x,u) nlmpcModel(x,u);   
+nlobj.Model.OutputFcn = @(x,u) x(1:numJoints); 
+nlobj.Optimization.CustomCostFcn = @(X,U,e,data) 
+nlmpcCostFunction(X,U,e,data, poseFinal, robot, 
+endEffector, Qr, Qt, Qu, Qv);  
+if ~isempty(world) && avoidCollisions 
+nlobj.Optimization.CustomIneqConFcn = @(X,U,e,data) 
+myIneqConFunction(X,U,e,data, safetyDistance, world, 
+robot); 
+end 
+nlobj.Jacobian.OutputFcn = @(x,u) 
+nlmpcJacobianOutputModel(x,u); 
+nlobj.Jacobian.StateFcn = @(x,u) nlmpcJacobianModel(x,u); 
+nlobj.Jacobian.CustomCostFcn = @(X,U,e,data) 
+nlmpcJacobianCost(X,U,e,data, poseFinal, robot, 
+endEffector, Qr, Qt, Qu, Qv); 
+if ~isempty(world) && avoidCollisions 
+nlobj.Jacobian.CustomIneqConFcn = @(X,U,e,data) 
+nlmpcJacobianConstraint(X,U,e,data, world, robot); 
+end 
+nlobj.Optimization.SolverOptions.FunctionTolerance = 
+0.01; 
+nlobj.Optimization.SolverOptions.StepTolerance = 0.01; 
+nlobj.Optimization.SolverOptions.MaxIter = 5; 
+nlobj.Optimization.UseSuboptimalSolution = true; 
+nlobj.Optimization.ReplaceStandardCost = true; 
+% nlobj.Optimization.SolverOptions.Display = 'iter
+detailed'; 
+nlobj.Optimization.SolverOptions.ConstraintTolerance = 
+0.01; 
+% Set constraint on States and MV. 
+stateMinValues = {-174.53;-2.2000;-174.53;-2.5656;
+174.53;-2.0500;-174.53;... -0.8727;-0.8727;-0.8727;-0.8727;-0.8727;-0.8727;
+0.8727}; 
+stateMaxValues = 
+{174.53;2.2000;174.53;2.5656;174.53;2.0500;174.53;... 
+0.8727;0.8727;0.8727;0.8727;0.8727;0.8727;0.8727}; 
+nlobj.States = struct('Min',stateMinValues,... 
+'Max',stateMaxValues); 
+nlobj.MV = struct('Min',{-1;-1;-1;-1;-10;-10;
+10},'Max',{1;1;1;1;10;10;10}); 
+% Time horizon in seconds 
+p = 2;  
+nlobj.PredictionHorizon = p; % prediction horizon 
+nlobj.ControlHorizon = 1; % control horizon 
+%% Generate Reference Trajectories using Closed-loop 
+trajectory optimization 
+% Initial conditions 
+x0 = [currentRobotJConfig', zeros(1,numJoints)]; 
+u0 = zeros(1,numJoints); 
+options = nlmpcmoveopt; 
+maxIters = 50; 
+success = 1; 
+% Initialize arrays to store the results 
+positions = zeros(numJoints,maxIters+1); 
+positions(:,1) = x0(1:numJoints)'; 
+velocities = zeros(numJoints,maxIters+1); 
+velocities(:,1) = x0(numJoints+1:end)'; 
+accelerations = zeros(numJoints,maxIters+1); 
+accelerations(:,1) = u0'; 
+timestamp = zeros(1,maxIters+1); 
+—————————————————————————————————— 
+% Run nlmpc iteratively over the specified time horizon 
+until goal is 
+% achieved or up to maxIters. 
+mv = u0; 
+time = 0; 
+numInfeas = 0; 
+% Uncomment below to display all successful outputs 
+% disp('Calculating collision-free trajectory...') 
+for timestep=1:maxIters 
+% Optimize next trajectory point 
+[mv,options,info] = nlmpcmove(nlobj,x0,mv,[],[], 
+options); 
+if info.ExitFlag < 0 
+numInfeas = numInfeas + 1; 
+disp('Failed to compute a feasible trajectory in 
+this step...') 
+end 
+if numInfeas>2 
+warning('Many infeasible solutions in a row. 
+Aborting...') 
+success = 0; 
+break; 
+end 
+% Update initial state and time for next iteration 
+x0 = info.Xopt(2,:); 
+time = time + nlobj.Ts; 
+% Store trajectory points 
+positions(:,timestep+1) = x0(1:numJoints)'; 
+velocities(:,timestep+1) = x0(numJoints+1:end)'; 
+accelerations(:,timestep+1) = info.MVopt(2,:)'; 
+timestamp(timestep+1) = time; 
+% Check if goal is achieved  
+jointTempFinal = info.Xopt(2,1:numJoints); 
+taskTempFinal = getTransform(robot, jointTempFinal', 
+endEffector); 
+anglesTempFinal = rotm2eul(taskTempFinal(1:3,1:3), 
+'XYZ'); 
+poseTempFinal =  
+[taskTempFinal(1:3,4);anglesTempFinal']; 
+diffTerminal = abs([poseFinal(1:3)
+poseTempFinal(1:3); 
+angdiff(poseTempFinal(4:6),poseFinal(4:6))]); 
+if all(diffTerminal<tolerance)        
+break; % goal achieved 
+end 
+end 
+robot.DataFormat = curFormat; 
+%% Output the reference trajectories 
+tFinal = timestep+1; 
+positions = positions(:,1:tFinal); 
+velocities = velocities(:,1:tFinal); 
+accelerations = accelerations(:,1:tFinal); 
+timestamp = timestamp(:,1:tFinal); 
+return; 
+%% Helper nlmpc functions 
+function dxdt = nlmpcModel(x,u) 
+dxdt = zeros(size(x)); 
+dxdt(1:numJoints) = x(numJoints+1:end); 
+dxdt(numJoints+1:end) = u; 
+end 
+function [A, B] = nlmpcJacobianModel(x,u) 
+A = zeros(numJoints*2, numJoints * 2);     
+A(1:numJoints, numJoints+1:end) = eye(numJoints); 
+B = zeros(numJoints*2,numJoints); 
+B(numJoints+1:end,:)=eye(numJoints);  
+end 
+function [C, D] = nlmpcJacobianOutputModel(x,u) 
+C = zeros(numJoints, numJoints * 2); 
+C(1:numJoints, 1:numJoints) = eye(numJoints); 
+D = zeros(numJoints, numJoints); 
+end 
+function cost =  nlmpcCostFunction(X,U,e,data, poseFinal, 
+robot, endEffector, Qr, Qt, Qu, Qv)   
+% Running Cost 
+costRunning = 0; 
+for i= 2:p+1 
+jointTemp = X(i,1:numJoints); 
+taskTemp = getTransform(robot, jointTemp', 
+endEffector); 
+—————————————————————————————————— 
+anglesTemp = rotm2eul(taskTemp(1:3,1:3), 'XYZ'); 
+poseTemp =  [taskTemp(1:3,4);anglesTemp']; 
+diffRunning = [poseFinal(1:3)-poseTemp(1:3); 
+angdiff(poseTemp(4:6),poseFinal(4:6))]; 
+costRunningTemp = diffRunning' * Qr * 
+diffRunning; 
+costRunning = costRunning + costRunningTemp + 
+U(i,:)*Qu*U(i,:)'; 
+end 
+% Terminal cost 
+costTerminal = diffRunning'* Qt * diffRunning + 
+X(p+1,numJoints+1:end)*Qv*X(p+1,numJoints+1:end)'; 
+% Total Cost 
+cost = costRunning + costTerminal; 
+end 
+function [G,Gmv,Ge] = nlmpcJacobianCost(X,U,e,data, 
+poseFinal, robot, endEffector, Qr, Qt, Qu, Qv) 
+% Initialize Jacobians 
+G = zeros(p,numJoints*2); 
+Gmv = zeros(p,numJoints); 
+Ge = 0; 
+% Update G 
+for i=1:p 
+jointTemp = X(i+1,1:numJoints); 
+taskTemp = getTransform(robot, jointTemp', 
+endEffector); 
+anglesTemp = rotm2eul(taskTemp(1:3,1:3), 'XYZ'); 
+poseTemp =  [taskTemp(1:3,4);anglesTemp']; 
+diffRunning = [poseFinal(1:3)-poseTemp(1:3); 
+angdiff(poseTemp(4:6),poseFinal(4:6))];  
+% From geometric to analytical robot Jacobian 
+rx = anglesTemp(1); 
+py = anglesTemp(2); 
+B = [ 1 0 sin(py); 0 cos(rx) -cos(py)*sin(rx); 0 
+sin(rx) cos(py)*cos(rx) ];  
+% Robot Jacobian 
+robotJacobianTemp = 
+geometricJacobian(robot,jointTemp',endEffector); 
+robotJacobian = robotJacobianTemp; 
+robotJacobian(1:3,:) = robotJacobianTemp(4:6,:); 
+robotJacobian(4:6,:) = 
+B\robotJacobianTemp(1:3,:); 
+% Running cost Jacobian 
+G(i,1:numJoints) = (-2 * diffRunning' * Qr * 
+robotJacobian);  
+Gmv(i,:) = 2 * U(i+1,:) * Qu; 
+end 
+% Terminal cost Jacobian 
+G(p,1:numJoints) = G(p,1:numJoints) + (-2 * 
+diffRunning' * Qt * robotJacobian); 
+G(p,numJoints+1:end) = 2 * X(p+1,numJoints+1:end) * 
+Qv; 
+end 
+function cineq = myIneqConFunction(X,U,e,data, 
+safetyDistance, world, robot) 
+% Copyright 2019 The MathWorks, Inc. 
+allDistances = zeros(p*numBodies*numObstacles,1); 
+for i =1:p 
+collisionConfig = X(i+1,1:numJoints); 
+[~, separationDist, ~] = checkCollision(robot, 
+collisionConfig', world, 'IgnoreSelfCollision', 'On', 
+'Exhaustive', 'on'); 
+tempDistances = 
+separationDist(1:robot.NumBodies,1:numObstacles); 
+tempDistances(all(isinf(tempDistances)|isnan(tempDistance
+ s),2),:) = []; % remove inf and nans 
+tempDistances(isinf(tempDistances)|isnan(tempDistances)) 
+= 0; 
+allDistances((1+(i
+1)*numBodies*numObstacles):numBodies*numObstacles*i,1) = 
+reshape(tempDistances', [numBodies*numObstacles,1]);    
+end 
+cineq = -allDistances + safetyDistance; 
+end 
+function [G,Gmv,Ge] = nlmpcJacobianConstraint(X,U,e,data, 
+world, robot) 
+% Initialize Jacobians 
+G = zeros(p, numJoints*2, p*numBodies*numObstacles); 
+—————————————————————————————————— 
+Gmv = zeros(p, numJoints, p*numBodies*numObstacles); 
+Ge = zeros(p*numBodies*numObstacles,1); 
+iter = 1; 
+for i=1:p 
+collisionConfig = X(i+1,1:numJoints); 
+[~, ~, allWntPts] = checkCollision(robot, 
+collisionConfig', world, 'IgnoreSelfCollision', 'On', 
+'Exhaustive', 'on');  
+for j=1:numBodies 
+for k=1:numObstacles 
+bodyNow = bodyIndices(j); 
+wtnPts = allWntPts(1+(bodyNow
+1)*3:3+(bodyNow-1)*3, 1+(k-1)*2:2+(k-1)*2); 
+if 
+isempty(wtnPts(isinf(wtnPts)|isnan(wtnPts))) 
+if any((wtnPts(:,1)-wtnPts(:,2))~=0)  
+normal = (wtnPts(:,1)
+wtnPts(:,2))/norm(wtnPts(:,1)-wtnPts(:,2)); 
+else 
+normal = [0;0;0]; 
+end 
+bodyJacobian = 
+geometricJacobian(robot,collisionConfig', 
+robot.BodyNames{bodyNow}); 
+G(i, 1:numJoints,  iter)= -normal' * 
+bodyJacobian(4:6,:); 
+else 
+G(i, 1:numJoints,  iter) = zeros(1, 
+numJoints); 
+end 
+iter = iter + 1;                  
+end            
+end         
+end 
+end ---------- exampleHelperTimeBasedStateInputsPickPlace.m----- 
+function stateDot = 
+exampleHelperTimeBasedStateInputsPickPlace(obj, 
+timeInterval, jointStates, t, state) 
+% This function is for internal use and may be removed in 
+a future release 
+% 
+%exampleHelperTimeBasedStateInputsPickPlace Wrapper 
+function for simulating joint-space time-based tracking 
+with an ODE solver 
+%   This function is used to pass time-based inputs to 
+the derivative 
+%   method of jointSpaceMotionModel so that it can be 
+used in an ODE 
+%   
+Solver. ODE Solvers require a function handle that 
+takes time as input 
+%   and output the state derivative. However, in the 
+trajectory tracking 
+%   case, the state derivative is dependent on the 
+interpolated value of 
+%   the reference trajectory at that instant in time. As 
+a result, this 
+%   helper function first computes the target state at 
+the instant in time 
+%   given by t using interpolation, then passes that to 
+the derivative of 
+%   the provided jointSpaceMotionModel object, which 
+computes the state 
+%   derivative. 
+% Copyright 2020 The MathWorks, Inc. 
+% Compute the interpolated target state given the 
+linear trajectory 
+% between the first and last values of jointStates 
+over the specified 
+% time interval at the current time, t 
+targetState = interp1(timeInterval, jointStates, t); 
+% Compute state derivative 
+stateDot = derivative(obj, state, targetState); 
+end ---- PickAndPlaceWorkflowUsingStateflowForMATLABExample.mlx---- 
+load('exampleHelperKINOVAGen3GripperColl.mat'); 
+currentRobotJConfig = homeConfiguration(robot); 
+coordinator = exampleHelperCoordinatorPickPlace(robot,currentRobotJConfig, 'gripper'); 
+coordinator.HomeRobotTaskConfig = trvec2tform([0.4, 0, 0.6])*axang2tform([0 1 0 pi]); 
+coordinator.PlacingPose{1} = trvec2tform([0.23 0.62 0.33])*axang2tform([0 1 0 pi]); 
+—————————————————————————————————— 
+coordinator.PlacingPose{2} = trvec2tform([0.23 -0.62 0.33])*axang2tform([0 1 0 pi]); 
+coordinator.FlowChart = exampleHelperFlowChartPickPlace('coordinator', coordinator); 
+answer = questdlg('Do you want to start the pick-and-place job now?', ... 
+         'Start job','Yes','No', 'No'); 
+switch answer 
+    case 'Yes' 
+        % Trigger event to start Pick and Place in the Stateflow Chart 
+        coordinator.FlowChart.startPickPlace;         
+    case 'No' 
+        % End Pick and Place 
+        coordinator.FlowChart.endPickPlace;         
+        delete(coordinator.FlowChart); 
+        delete(coordinator); 
+end ------- exampleHelperCoordinatorPickPlace.m--------------- 
+classdef exampleHelperCoordinatorPickPlace < handle 
+% This class is for internal use and may be removed in a 
+future release 
+% 
+%exampleHelperCoordinatorPickPlace Class used to run the 
+Stateflow chart 
+%and hold all pick and place runtime data 
+%   This class is used to control the pick-and-place 
+workflow execution. 
+%   The class serves two main purposes: 
+%      1. It handles visualization for the 
+%         workflow  
+%      2. It stores all data about the current pick and 
+place job 
+
+  
+    properties          
+        FlowChart 
+        Robot 
+        World = {}; 
+        Parts = {}; 
+Obstacles = {}; 
+DetectedParts = {}; 
+RobotEndEffector 
+CurrentRobotJConfig 
+CurrentRobotTaskConfig 
+NextPart = 0; 
+PartOnRobot = 0; 
+HomeRobotTaskConfig  
+PlacingPose 
+GraspPose 
+Figure 
+TimeStep 
+MotionModel 
+NumJoints 
+NumDetectionRuns = 0; 
+PathHandle 
+end 
+methods 
+function obj = 
+exampleHelperCoordinatorPickPlace(robot, 
+currentRobotJConfig, robotEndEffector) 
+obj.Robot = robot;             
+obj.CurrentRobotJConfig = 
+currentRobotJConfig; 
+obj.RobotEndEffector = robotEndEffector; 
+obj.CurrentRobotTaskConfig = 
+getTransform(obj.Robot, obj.CurrentRobotJConfig, 
+obj.RobotEndEffector); 
+obj.TimeStep = 0.1; % Visualization time step 
+obj.MotionModel = 
+jointSpaceMotionModel('RigidBodyTree', obj.Robot); 
+obj.NumJoints = 
+numel(obj.CurrentRobotJConfig); 
+% Initialize visualization 
+obj.Figure = 
+interactiveRigidBodyTree(obj.Robot,'ShowMarker',false, 
+'Frames', 'off');  
+obj.Figure.Configuration = 
+obj.CurrentRobotJConfig; 
+obj.Figure.ShowMarker = false; 
+hold on 
+axis([-1 1 -1 1 -0.1 1.5]); 
+view(58,25);             
+end 
+—————————————————————————————————— 
+     
+       function visualizeWorld(obj) 
+           try 
+            bench = obj.World{1}; 
+            belt1 = obj.World{2}; 
+            belt2 = obj.World{3}; 
+  
+            % Render world 
+            [~, p1] = show(bench); 
+            [~, p2] = show(belt1); 
+            [~, p3] = show(belt2); 
+  
+            p1.FaceColor = [1 0.5 0]; 
+            p1.FaceAlpha = 1.0; 
+            p1.LineStyle = 'none'; 
+  
+            p2.FaceColor = [128,128,128]/255; 
+            p2.FaceAlpha = 1.0; 
+            p2.LineStyle = 'none'; 
+  
+            p3.FaceColor = [128,128,128]/255; 
+            p3.FaceAlpha = 1.0;   
+            p3.LineStyle = 'none'; 
+             
+            % Visualize obstacles 
+            for i=1:numel(obj.Obstacles) 
+                [~, obs] = show(obj.Obstacles{i}); 
+                obs.LineStyle = 'none'; 
+                obs.FaceColor = 'b'; 
+            end 
+  
+            drawnow; 
+           catch 
+           end 
+       end 
+  
+  
+        function visualizeParts(obj) 
+            for i = 1:length(obj.Parts) 
+                tempPose = [0,0,0]; % to set 
+transformation reference 
+                correctPose = obj.Parts{i}.mesh.Pose; 
+                obj.Parts{i}.mesh.Pose = 
+trvec2tform(tempPose); 
+                [~, obj.Parts{i}.plot] = 
+show(obj.Parts{i}.mesh); 
+                obj.Parts{i}.plot.LineStyle = 'none';  
+                obj.Parts{i}.plotHandle = hgtransform; 
+Author — Title   
+29 
+obj.Parts{i}.plot.Parent = 
+obj.Parts{i}.plotHandle; 
+obj.Parts{i}.mesh.Pose = correctPose; 
+obj.Parts{i}.plotHandle.Matrix = 
+obj.Parts{i}.mesh.Pose; 
+obj.Parts{i}.plot.FaceColor = 
+obj.Parts{i}.color;  
+end 
+drawnow; 
+end 
+function visualizeRobot(obj, robotStates, 
+trajTimes) 
+% Visualize robot motion            
+for k = 1:length(trajTimes) 
+configNow = 
+robotStates(k,1:obj.NumJoints); 
+obj.Figure.Configuration = configNow; 
+obj.Figure.ShowMarker = false; 
+% Update current robot configuration 
+obj.CurrentRobotJConfig = configNow; 
+obj.CurrentRobotTaskConfig = 
+getTransform(obj.Robot, obj.CurrentRobotJConfig, 
+obj.RobotEndEffector); 
+% Visualize parts 
+if obj.PartOnRobot~=0 
+obj.Parts{obj.PartOnRobot}.mesh.Pose 
+= obj.CurrentRobotTaskConfig * trvec2tform([0 0 0.04]); 
+obj.Parts{obj.PartOnRobot}.plotHandle.Matrix = 
+obj.Parts{obj.PartOnRobot}.mesh.Pose; 
+end 
+drawnow; 
+pause(0.05); 
+end 
+end 
+function visualizePath(obj, positions) 
+poses = zeros(size(positions,2),3); 
+for i=1:size(positions,2)                
+poseNow = getTransform(obj.Robot, 
+positions(:,i)', obj.RobotEndEffector); 
+poses(i,:) = [poseNow(1,4), poseNow(2,4), 
+poseNow(3,4)]; 
+end 
+—————————————————————————————————— 
+obj.PathHandle = plot3(poses(:,1), 
+poses(:,2), poses(:,3),'r-','LineWidth',5);             
+drawnow; 
+end 
+% Display current job state 
+function displayState(obj, message) 
+disp(message); 
+end 
+% Delete function 
+function delete(obj) 
+delete(obj.FlowChart) 
+end 
+end 
+end ------ exampleCommandPickingLogic.m---------------------- 
+function exampleCommandPickingLogic(coordinator) 
+%CommandPickingLogic Determine which parts to pick next 
+%   This command instructs the robot which parts to pick 
+next based on the 
+%   order of a preset list. 
+% Parts will be picked according to order in 
+coordinator.DetectedParts list 
+coordinator.NextPart = coordinator.NextPart + 1;  
+if 
+coordinator.NextPart<=length(coordinator.Parts)                
+% Objects are placed on either belt1 or belt2 
+according to 
+% their type 
+if 
+coordinator.DetectedParts{coordinator.NextPart}.type == 1 
+coordinator.DetectedParts{coordinator.NextPart}.placingBe
+ lt = 1;                     
+else 
+coordinator.DetectedParts{coordinator.NextPart}.placingBe
+ lt = 2; 
+end 
+% Trigger Stateflow chart Event 
+coordinator.FlowChart.partsDetected; 
+return; 
+end 
+% Trigger Stateflow chart Event 
+coordinator.FlowChart.noPartsDetected; 
+end --------------- exampleCommandMoveToTaskConfig.m---------- 
+function exampleCommandMoveToTaskConfig(coordinator, 
+taskConfig, tolerance, avoidCollisions) 
+%CommandMoveToTaskConfig Move the manipulator to a task
+space position 
+%   This command moves the manipulator from its current 
+pose to a 
+%   desired task-space pose. The move is executed using a 
+nonlinear model 
+%   predictive controller (nlmpc) to generate a 
+collision-free reference trajectory. 
+%   The trajectory is simulated using a model of the 
+robot under 
+%   joint-space motion control. This also updates the 
+visualization.  
+% 
+% Copyright 2020 The MathWorks, Inc. 
+%   Execute the command, which simulates robot 
+motion from the current to the target pose 
+%   To execute this motion, the command calls a 
+helper 
+%   function, 
+exampleHelperPlanExecuteTrajectoryPickPlace, that 
+%   plans an optimized reference trajectory using 
+a nonlinear 
+%   MPC solver and then simulates the motion of 
+the robot under 
+%   joint-space position control. The helper 
+function also 
+%   ensures that the visualization is updated 
+accordingly. 
+% Execute closed-loop trajectory optimization and 
+control using 
+% model predictive control 
+—————————————————————————————————— 
+mpcTimeStep = 0.6; 
+[positions, velocities, accelerations, timestamp, 
+success] = 
+exampleHelperPlanExecuteTrajectoryPickPlace(coordinator.R
+ obot, mpcTimeStep,  coordinator.Obstacles, 
+coordinator.RobotEndEffector, 
+coordinator.CurrentRobotJConfig, taskConfig, tolerance, 
+avoidCollisions); 
+if success==0 
+error('Cannot compute motion to reach desired 
+task configuration. Aborting...') 
+end 
+%% Execute the trajectory using low-fidelity 
+simulation 
+targetStates = 
+[positions;velocities;accelerations]';  
+targetTime = timestamp; 
+initState = [positions(:,1);velocities(:,1)]'; 
+trajTimes = 
+targetTime(1):coordinator.TimeStep:targetTime(end); 
+[~,robotStates] = ode15s(@(t,state) 
+exampleHelperTimeBasedStateInputsPickPlace(coordinator.Mo
+ tionModel, targetTime, targetStates, t, state), 
+trajTimes, initState); 
+%% Visualize trajectory 
+% Uncomment below to display all successful 
+outputs 
+% disp('Executing collision-free trajectory...') 
+visualizePath(coordinator,positions); 
+visualizeRobot(coordinator, robotStates, 
+trajTimes); 
+% Deleta path on plot 
+coordinator.PathHandle.Visible = 'off'; 
+% Update current robot configuration 
+coordinator.CurrentRobotJConfig = 
+positions(:,end)'; 
+coordinator.CurrentRobotTaskConfig = 
+getTransform(coordinator.Robot, 
+coordinator.CurrentRobotJConfig, 
+coordinator.RobotEndEffector);  
+% Trigger Stateflow chart Event 
+coordinator.FlowChart.taskConfigReached;  
+end --------- exampleCommandDetectParts.m------------------ 
+function exampleCommandDetectParts(coordinator) 
+% 
+%CommandDetectParts Detect parts and identify their poses 
+%   In this simplified workflow, the parts are detected 
+using a list in the 
+%   coordinator that both indicates the part exists and 
+provides its 
+%   starting pose. 
+% Copyright 2020 The MathWorks, Inc. 
+% This function detects parts using a list in the 
+coordinator that also provides the pose.  
+% This is a simplified workflow that could be replaced 
+using sensor measurements 
+% such as camera images or point clouds form 3D scanners. 
+if ~isempty(coordinator.Parts) && 
+coordinator.NextPart<=length(coordinator.Parts) 
+coordinator.DetectedParts = 
+coordinator.Parts; 
+% Trigger event 'partDetected' on Stateflow 
+coordinator.FlowChart.partsDetected; 
+return; 
+end 
+coordinator.NumDetectionRuns = 
+coordinator.NumDetectionRuns +1; 
+% Trigger Stateflow chart Event 
+coordinator.FlowChart.noPartsDetected;  
+end  ------- exampleCommandComputeGraspPose.m------------- 
+function exampleCommandComputeGraspPose(coordinator)  
+%CommandComputeGraspPose Compute the grasp pose for a 
+part with a known pose 
+%   This command computes the task-space grasping pose 
+required for the 
+%   manipulator to pick up a part. The grasp pose is 
+based on the pose of 
+—————————————————————————————————— 
+%   the part to be picked up, which is known and passed 
+by the dispatcher 
+%   object. 
+% 
+% Copyright 2020 The MathWorks, Inc. 
+%   This functioncomputes the grasping pose by 
+applying a 
+%   pre-defined transform relative the pose of 
+the object. This 
+%   could be replaced by more advanced methods. 
+For example, 
+%   the grasp pose could be found using point 
+cloud data 
+%   together with machine / deep learning based 
+on object 
+%   poses. 
+coordinator.GraspPose = 
+trvec2tform(coordinator.Parts{coordinator.NextPart}.cente
+ rPoint + [0 0 0.04])*axang2tform([0 1 0 pi]); 
+% Trigger Stateflow chart Event 
+coordinator.FlowChart.nextAction;  
+end -------- exampleCommandClassifyParts.m------------------- 
+function exampleCommandClassifyParts(coordinator) 
+% 
+%CommandClassifyParts Classify the parts to determine 
+where to place them 
+%   This command classifies the detected parts using a 
+numeric type: type 1 
+%   or type 2. 
+% 
+% Copyright 2020 The MathWorks, Inc. 
+% In this method, the classification is assumed to be 
+known. In 
+% practice, this may be replaced by more complex 
+classification 
+% tools. For example, the robot can use camera images 
+or point 
+% clouds  from 3D scanners to classify objects in the 
+scene. 
+if ~isempty(coordinator.DetectedParts) 
+coordinator.DetectedParts{1}.type = 1; 
+coordinator.DetectedParts{2}.type = 1; 
+coordinator.DetectedParts{3}.type = 2; 
+end 
+% Trigger Stateflow chart Event 
+coordinator.FlowChart.partsClassified;        
+end ------------- exampleCommandBuildWorld.m---------------------- 
+function exampleCommandBuildWorld(coordinator) 
+%CommandBuildWorld Construct the world used for 
+visualization and collision detection 
+%   This command constructs the environment, consisting 
+of the workstation, 
+%   belts, parts to be moved, and obstacles. The robot is 
+constructed 
+%   separately. These objects are created using collision 
+primitives and 
+%   placed in the right spots. In the workflow, this 
+world is used during 
+%   trajectory generation/optimization for collision
+checking, and during 
+%   the visualization step. 
+% Construct the Workstation (only for visualization) 
+bench = collisionBox(0.5, 0.7, 0.05); 
+belt1 = collisionBox(1.3, 0.4, 0.05); 
+belt2 = collisionBox(1.3, 0.4, 0.05); 
+TBench = trvec2tform([0.4 0 0.2]); 
+TBelt1 = trvec2tform([0 -0.6 0.2]); 
+TBelt2 = trvec2tform([0 0.6 0.2]); 
+bench.Pose = TBench; 
+belt1.Pose = TBelt1; 
+belt2.Pose = TBelt2; 
+coordinator.World = {bench, belt1, belt2}; 
+obs1 = collisionSphere(0.13); 
+Tobs1 = trvec2tform([0.4 0.38 0.4]); 
+obs1.Pose = Tobs1; 
+—————————————————————————————————— 
+    obs2 = collisionSphere(0.13); 
+    Tobs2 = trvec2tform([0.4 -0.38 0.4]); 
+    obs2.Pose = Tobs2; 
+  
+    coordinator.Obstacles = {obs1, obs2};     
+  
+    % Add the parts, which are only used for 
+visualization and 
+    % simulation. A separate tool ensures that when a 
+part is 
+    % gripped, it is included in the collision detection 
+stage of 
+    % the trajectory optimization workflow. 
+    box2 = collisionBox(0.06, 0.06, 0.1); 
+    box3 = collisionBox(0.06, 0.06, 0.1); 
+    box1 = collisionBox(0.06, 0.06, 0.1); 
+  
+    % Move the parts into position 
+    TBox2 = trvec2tform([0.5 -0.15 0.26]); 
+    TBox3 = trvec2tform([0.52 0 0.26]); 
+    TBox1 = trvec2tform([0.4 -0.1 0.26]); 
+  
+    box2.Pose = TBox2; 
+    box3.Pose = TBox3; 
+    box1.Pose = TBox1; 
+  
+    % Set the part mesh and color 
+    part1.mesh = box2; 
+    part2.mesh = box3; 
+    part3.mesh = box1; 
+  
+    part1.color = 'y'; 
+    part2.color = 'y'; 
+    part3.color = 'g'; 
+  
+    part1.centerPoint = tform2trvec(part1.mesh.Pose); 
+    part2.centerPoint = tform2trvec(part2.mesh.Pose); 
+    part3.centerPoint = tform2trvec(part3.mesh.Pose); 
+  
+    part1.plot = []; 
+    part2.plot = []; 
+    part3.plot = []; 
+  
+    coordinator.Parts = {part1, part2, part3}; 
+  
+    % Visualize world and parts 
+    visualizeWorld(coordinator) 
+    visualizeParts(coordinator) 
+% Trigger Stateflow chart Event 
+coordinator.FlowChart.worldBuilt; 
+end ----------- exampleCommandActivateGripper.m------------- 
+function exampleCommandActivateGripper(coordinator, 
+state) 
+% This class is for internal use and may be removed in a 
+future release 
+% 
+%CommandActivateGripper Command function to activate 
+gripper   
+%   This command activates and deactivates the gripper. 
+In this implementation, this action has two 
+%   impacts: 
+%      - When the gripper is activated, the picked part 
+is added as a collision mesh to the robot rigid body tree 
+so that path planning includes the part in the 
+%      obstacle avoidance stage. When deactivating the 
+gripper, the placed 
+%      part is removed from the collision meshes of the 
+rigid body tree. 
+%      
+being - The visualization is updated to move the object 
+%      picked up by the gripper.  
+% 
+% Copyright 2020 The MathWorks, Inc. 
+%   Based on the state, decide whether to 
+activate or 
+%   deactivate the gripper 
+if strcmp(state,'on') == 1 
+% Activate gripper  
+coordinator.PartOnRobot = 
+coordinator.NextPart; 
+% Add new picked part in collision checking 
+partBody = 
+getBody(coordinator.Robot,'pickedPart'); 
+addCollision(partBody,"sphere", 0.12 , 
+trvec2tform([0 0 0])); 
+else 
+% Deactivate gripper  
+coordinator.PartOnRobot = 0; 
+% Remove dropped part from collision checking 
+—————————————————————————————————— 
+partBody = 
+getBody(coordinator.Robot,'pickedPart'); 
+clearCollision(partBody); 
+end 
+% Trigger Stateflow chart Event 
+coordinator.FlowChart.nextAction;  
+end
